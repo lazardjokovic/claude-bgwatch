@@ -1,0 +1,511 @@
+#!/usr/bin/env bash
+#
+# claude-bgwatch - list and follow what every running Claude Code session has
+# going in the background: Bash tasks, foreground commands still running, and
+# monitors.
+#
+# None of what this reads is a documented Claude Code interface. Each piece,
+# and where it comes from, is in docs/how-it-works.md, so that when an update
+# moves one of them the fix starts there rather than with a search.
+#
+# Written for the bash macOS ships (3.2): no associative arrays, no mapfile,
+# no ${var,,}. CI runs it on macOS for that reason.
+
+set -u
+
+VERSION='0.1.0'
+
+CLAUDE_BIN=${CLAUDE_BGWATCH_CLAUDE:-claude}
+CONFIG_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+TMP_ROOT=${CLAUDE_BGWATCH_TMP:-/tmp/claude-$(id -u)}
+BACKLOG=20
+LIMIT=10
+ASSUME_YES=0
+SHOW_FINISHED=0
+
+PROG=${0##*/}
+
+# ---------------------------------------------------------------- output ---
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'; C_RST=$'\033[0m'
+  C_BG=$'\033[32m'; C_FG=$'\033[33m'; C_MON=$'\033[36m'; C_DONE=$'\033[2m'
+else
+  C_DIM=''; C_BOLD=''; C_RST=''; C_BG=''; C_FG=''; C_MON=''; C_DONE=''
+fi
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+note() { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RST" >&2; }
+
+usage() {
+  cat <<EOF
+$PROG $VERSION - see and follow what your Claude Code sessions run in the background
+
+Usage:
+  $PROG                     list what is running, in every session
+  $PROG --finished          ... and the background tasks that have ended
+  $PROG <sel>...            follow one or more of them (tail -f; monitors show events)
+  $PROG all                 follow everything that is running
+  $PROG show <sel>          print a task's whole output (or a monitor's events)
+  $PROG kill <sel>...       stop tasks (asks first; -y to skip)
+
+  <sel> is a number from the list, or a task id (or the start of one).
+  Numbers can change between runs; task ids do not.
+
+Options:
+  -n N           lines of earlier output to show when following (default $BACKLOG)
+  -f, --finished include ended background tasks in the list
+  -l N           how many ended tasks to list (default $LIMIT)
+  -y, --yes      do not ask before stopping a task
+  -h, --help     this help
+  -V, --version  print the version
+
+Kinds:
+  bg       a Bash command Claude started with run_in_background
+  fg       a Bash command Claude is waiting on right now
+  monitor  a Monitor; its events are read from the session's transcript
+
+Unofficial. Not affiliated with or endorsed by Anthropic.
+EOF
+}
+
+# ----------------------------------------------------------------- setup ---
+
+need() { command -v "$1" >/dev/null 2>&1 || die "needs '$1' on PATH${2:+ ($2)}"; }
+
+WORK=''
+CHILD_PIDS=''
+
+cleanup() {
+  local p
+  for p in $CHILD_PIDS; do kill_tree "$p" 2>/dev/null; done
+  [ -n "$WORK" ] && rm -rf "$WORK"
+}
+
+# Every descendant of $1, deepest first, then $1 itself. A task is a shell
+# with the real command below it, and stopping only the shell leaves the
+# command running with nobody to report it.
+descendants() {
+  ps -A -o pid=,ppid= | awk -v root="$1" '
+    { kids[$2] = kids[$2] " " $1 }
+    function walk(p,   n, a, i) { n = split(kids[p], a, " "); for (i = 1; i <= n; i++) walk(a[i]); print p }
+    END { walk(root) }'
+}
+
+kill_tree() {
+  local p
+  for p in $(descendants "$1"); do kill -TERM "$p" 2>/dev/null; done
+}
+
+alive() { kill -0 "$1" 2>/dev/null; }
+
+# This process and everything above it. When claude-bgwatch is itself run by
+# Claude, the command running it is a task too, and listing it is noise.
+self_chain() {
+  local p=$$
+  while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null; do
+    echo "$p"
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+  done
+}
+
+# GNU stat first: its -f means something else, and prints a result for it.
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
+
+human_size() {
+  awk -v b="$1" 'BEGIN {
+    split("B K M G", u, " "); i = 1
+    while (b >= 1024 && i < 4) { b /= 1024; i++ }
+    printf (i == 1 ? "%d%s" : "%.1f%s"), b, u[i] }'
+}
+
+human_ago() {
+  local s=$1
+  if   [ "$s" -lt 60 ];    then echo "${s}s ago"
+  elif [ "$s" -lt 3600 ];  then echo "$((s / 60))m ago"
+  elif [ "$s" -lt 86400 ]; then echo "$((s / 3600))h ago"
+  else echo "$((s / 86400))d ago"; fi
+}
+
+# Claude runs every command as `<shell> -c '... && eval '<command>' < /dev/null
+# && pwd -P >| ...'`. What is between the quotes of that eval is the command
+# as Claude wrote it, with each ' quoted: as '\'' for a Bash task and as
+# '"'"' for a monitor.
+command_of() {
+  local c=$1
+  case $c in *" eval '"*) ;; *) return 1 ;; esac
+  c=${c#* eval \'}
+  case $c in
+    *"' < /dev/null"*) c=${c%\' < /dev/null*} ;;
+    *) c=${c%\'*} ;;
+  esac
+  printf '%s' "$c" | sed -e "s/'\\\\''/'/g" -e "s/'\"'\"'/'/g"
+}
+
+oneline() { tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'; }
+
+# ------------------------------------------------------------- sessions ---
+
+# pid, session id, name and working directory of every live session, from
+# Claude Code's own listing.
+sessions() {
+  "$CLAUDE_BIN" agents --json 2>/dev/null | jq -r '
+    .[]? | select(.pid != null and .sessionId != null)
+    | [.pid, .sessionId, (.name // ""), (.cwd // "")]
+    | map(tostring | gsub("\t"; " ")) | join("\t")' 2>/dev/null
+}
+
+transcript_of() {
+  local f
+  for f in "$CONFIG_DIR"/projects/*/"$1".jsonl; do
+    [ -f "$f" ] && { echo "$f"; return 0; }
+  done
+  return 1
+}
+
+# Every background task a transcript records: task id, kind, the command, and
+# a monitor's description. The command comes from the tool call and the task
+# id from its result, joined on the tool call's id. Cached per session.
+task_map() {
+  local sid=$1 t=$2 cache="$WORK/map-$1"
+  if [ ! -f "$cache" ]; then
+    if [ -f "$t" ]; then
+      grep -F -e '"name":"Monitor"' -e '"name":"Bash"' -e 'Monitor started (task' \
+              -e 'running in background with ID:' "$t" 2>/dev/null | jq -r '
+        (.message.content? | arrays | .[]) as $c
+        | if $c.type == "tool_use" and ($c.name == "Monitor" or ($c.name == "Bash" and $c.input.run_in_background == true)) then
+            ["U", $c.id, (if $c.name == "Monitor" then "monitor" else "bg" end),
+             (($c.input.command // "") | gsub("\\s+"; " ") | gsub("^ | $"; "")),
+             (($c.input.description // "") | gsub("\\s+"; " "))] | join("\t")
+          elif $c.type == "tool_result" then
+            ($c.content | if type == "array" then map(.text? // "") | join("") else tostring end)
+            | (capture("Monitor started \\(task (?<t>[A-Za-z0-9]+)")? // capture("running in background with ID: (?<t>[A-Za-z0-9]+)")?)
+            | ["R", $c.tool_use_id, .t] | join("\t")
+          else empty end' 2>/dev/null | awk -F'\t' '
+        $1 == "U" { kind[$2] = $3; cmd[$2] = $4; desc[$2] = $5; order[++n] = $2 }
+        $1 == "R" { tid[$2] = $3 }
+        END { for (i = 1; i <= n; i++) { u = order[i]; if (u in tid) print tid[u] "\t" kind[u] "\t" cmd[u] "\t" desc[u] } }'
+    fi > "$cache"
+  fi
+  cat "$cache"
+}
+
+cwd_of_transcript() {
+  grep -m1 -o '"cwd":"[^"]*"' "$1" 2>/dev/null | sed 's/^"cwd":"//; s/"$//'
+}
+
+# ------------------------------------------------------------------ rows ---
+
+# One row per task, tab separated, written to $WORK/rows:
+#   1 number  2 kind  3 task id  4 session  5 project  6 pid  7 age
+#   8 size    9 command  10 file to read  11 description  12 running|ended
+#   13 session id
+collect() {
+  local rows="$WORK/rows" skip spid sid name cwd t label project
+  local cpid args cmd norm fd1 file tid kind desc size age hit
+  : > "$rows"
+  skip=" $(self_chain | tr '\n' ' ') "
+  # The file this very command writes into, so it is not listed as ended.
+  lsof -nP -a -p "$(self_chain | paste -sd, -)" -d 1 -F n 2>/dev/null | sed -n 's/^n//p' > "$WORK/self"
+  ps -A -o pid=,ppid= > "$WORK/ps"
+  sessions > "$WORK/sessions"
+
+  while IFS=$'\t' read -r spid sid name cwd; do
+    t=$(transcript_of "$sid") || t=''
+    label=${name:-${sid%%-*}}
+    project=${cwd##*/}
+    awk -v p="$spid" '$2 == p { print $1 }' "$WORK/ps" > "$WORK/kids"
+    while read -r cpid; do
+      case $skip in *" $cpid "*) continue ;; esac
+      args=$(ps -ww -o args= -p "$cpid" 2>/dev/null) || continue
+      cmd=$(command_of "$args") || continue
+      norm=$(printf '%s' "$cmd" | oneline)
+      age=$(ps -o etime= -p "$cpid" 2>/dev/null | tr -d ' ')
+      # Where the command's output goes says what it is: a Bash task writes
+      # into tasks/<id>.output, a monitor's stdout is a socket to Claude.
+      fd1=$(lsof -nP -a -p "$cpid" -d 1 -F n 2>/dev/null | sed -n 's/^n//p' | head -1)
+      desc=''
+      case $fd1 in
+        */tasks/*.output)
+          file=$fd1
+          tid=${fd1##*/}; tid=${tid%.output}
+          kind='fg'
+          if [ -n "$t" ]; then
+            hit=$(task_map "$sid" "$t" | awk -F'\t' -v id="$tid" '$1 == id { print $4; f = 1 } END { exit !f }') && { kind='bg'; desc=$hit; }
+          fi
+          size=$(human_size "$(wc -c < "$file" | tr -d ' ')")
+          ;;
+        *)
+          kind=monitor; file=$t; size='-'; tid='-'
+          if [ -n "$t" ]; then
+            hit=$(task_map "$sid" "$t" | C="$norm" awk -F'\t' '$2 == "monitor" && $3 == ENVIRON["C"] { id = $1; d = $4 } END { if (id != "") print id "\t" d }')
+            [ -n "$hit" ] && { tid=${hit%%$'\t'*}; desc=${hit#*$'\t'}; }
+          fi
+          ;;
+      esac
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        0 "$kind" "$tid" "$label" "$project" "$cpid" "$age" "$size" "$norm" "$file" "$desc" running "$sid" >> "$rows"
+    done < "$WORK/kids"
+  done < "$WORK/sessions"
+
+  collect_ended >> "$rows"
+  awk -F'\t' 'BEGIN { OFS = "\t" } { $1 = NR; print }' "$rows" > "$rows.n" && mv "$rows.n" "$rows"
+}
+
+# Background tasks whose output is still on disk but whose command has ended,
+# newest first. Claude deletes a foreground command's file when it finishes,
+# so what is left here is background work.
+collect_ended() {
+  local root f sid t tid label project line now kind cmd desc m
+  root=$(cd -P "$TMP_ROOT" 2>/dev/null && pwd) || return 0
+  now=$(date +%s)
+  for f in "$root"/*/*/tasks/*.output; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    tid=${f##*/}; tid=${tid%.output}
+    awk -F'\t' -v id="$tid" '$3 == id { f = 1 } END { exit !f }' "$WORK/rows" && continue
+    grep -qxF "$f" "$WORK/self" && continue
+    printf '%s\t%s\n' "$(mtime "$f")" "$f"
+  done | sort -rn | while IFS=$'\t' read -r m f; do
+    tid=${f##*/}; tid=${tid%.output}
+    sid=${f%/tasks/*}; sid=${sid##*/}
+    t=$(transcript_of "$sid") || t=''
+    label=$(awk -F'\t' -v s="$sid" '$2 == s { print $3 }' "$WORK/sessions")
+    label=${label:-${sid%%-*}}
+    project=''
+    [ -n "$t" ] && { project=$(cwd_of_transcript "$t"); project=${project##*/}; }
+    kind='bg'; cmd=''; desc=''
+    if [ -n "$t" ]; then
+      line=$(task_map "$sid" "$t" | awk -F'\t' -v id="$tid" '$1 == id')
+      if [ -n "$line" ]; then
+        kind=$(printf '%s' "$line" | cut -f2)
+        cmd=$(printf '%s' "$line" | cut -f3)
+        desc=$(printf '%s' "$line" | cut -f4)
+      fi
+    fi
+    [ "$kind" = monitor ] && [ -n "$t" ] && f=$t
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      0 "$kind" "$tid" "$label" "${project:--}" '-' "$(human_ago $((now - m)))" \
+      "$(if [ "$kind" = monitor ]; then echo -; else human_size "$(wc -c < "$f" | tr -d ' ')"; fi)" \
+      "${cmd:-?}" "$f" "$desc" ended "$sid"
+  done
+}
+
+# ------------------------------------------------------------------ list ---
+
+list() {
+  local cols running ended
+  cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 120)}
+  running=$(awk -F'\t' '$12 == "running"' "$WORK/rows" | wc -l | tr -d ' ')
+  ended=$(awk -F'\t' '$12 == "ended"' "$WORK/rows" | wc -l | tr -d ' ')
+
+  if [ "$running" -eq 0 ] && { [ "$SHOW_FINISHED" -eq 0 ] || [ "$ended" -eq 0 ]; }; then
+    if [ -s "$WORK/sessions" ]; then
+      note "Nothing running in the background in $(wc -l < "$WORK/sessions" | tr -d ' ') session(s)."
+    else
+      note "No Claude Code sessions found."
+    fi
+    [ "$SHOW_FINISHED" -eq 0 ] && [ "$ended" -gt 0 ] && note "$ended ended task(s): $PROG --finished"
+    return 0
+  fi
+
+  awk -F'\t' -v cols="$cols" -v fin="$SHOW_FINISHED" -v limit="$LIMIT" \
+      -v bold="$C_BOLD" -v dim="$C_DIM" -v rst="$C_RST" \
+      -v cbg="$C_BG" -v cfg="$C_FG" -v cmon="$C_MON" -v cdone="$C_DONE" '
+    function cut(s, n) { return length(s) > n ? substr(s, 1, n - 1) "…" : s }
+    BEGIN { printf "%s%3s  %-7s  %-10s  %-18s  %-14s  %8s  %6s  %s%s\n", bold, "#", "KIND", "TASK", "SESSION", "PROJECT", "AGE", "OUT", "COMMAND", rst
+            w = cols - 81; if (w < 20) w = 20 }
+    $12 == "ended" { if (!fin || ++shown > limit) next
+                     if (!sep++) printf "%s%s%s\n", dim, "    ended", rst }
+    {
+      c = ($2 == "bg") ? cbg : ($2 == "fg") ? cfg : cmon
+      if ($12 == "ended") c = cdone
+      what = ($11 != "") ? "\"" $11 "\"  " $9 : $9
+      printf "%3s  %s%-7s%s  %-10s  %-18s  %-14s  %8s  %6s  %s\n", $1, c, $2, rst, $3, cut($4, 18), cut($5, 14), $7, $8, cut(what, w)
+    }' "$WORK/rows"
+
+  [ "$SHOW_FINISHED" -eq 0 ] && [ "$ended" -gt 0 ] && note "$ended ended task(s) not shown: $PROG --finished"
+  return 0
+}
+
+# --------------------------------------------------------------- select ---
+
+# Print the rows a selector names. A number is a row; anything else is a task
+# id, whole or the start of one, and must name exactly one task.
+resolve() {
+  local sel=$1 out n
+  case $sel in
+    ''|*[!0-9]*)
+      out=$(awk -F'\t' -v s="$sel" '$3 == s' "$WORK/rows")
+      [ -z "$out" ] && [ "${#sel}" -ge 3 ] && out=$(awk -F'\t' -v s="$sel" 'index($3, s) == 1' "$WORK/rows")
+      ;;
+    *) out=$(awk -F'\t' -v s="$sel" '$1 == s' "$WORK/rows") ;;
+  esac
+  [ -n "$out" ] || die "no task '$sel' (run $PROG to see the list)"
+  n=$(printf '%s\n' "$out" | wc -l | tr -d ' ')
+  [ "$n" -eq 1 ] || die "'$sel' matches $n tasks; give more of the id"
+  printf '%s\n' "$out"
+}
+
+field() { printf '%s' "$1" | cut -f"$2"; }
+
+# ---------------------------------------------------------------- follow ---
+
+# A monitor's events, one per notification Claude received. Claude records an
+# event as a user message when it is delivered straight away, and as an
+# enqueue when it arrives mid-turn, which is sometimes followed by a user
+# message with the same text once it is delivered. The same event is printed
+# once either way.
+monitor_events() {
+  grep --line-buffered -F "<task-id>$1</task-id>" | jq -n --unbuffered -r '
+    foreach (inputs | select(.type == "user" or .type == "queue-operation")) as $l (
+      {pending: {}, out: null};
+      ($l.content // $l.message.content) as $c
+      | if ($c | type) != "string" then .out = null
+        elif $l.type == "queue-operation" then
+          (if $l.operation == "enqueue" then .pending[$c] = true | .out = $c else .out = null end)
+        elif .pending[$c] then del(.pending[$c]) | .out = null
+        else .out = $c end;
+      .out // empty)
+    | first((capture("<event>(?<e>[\\s\\S]*?)</event>") | .e),
+            ("· " + first((capture("<summary>(?<s>[\\s\\S]*?)</summary>") | .s), "notification")))
+    | gsub("&lt;"; "<") | gsub("&gt;"; ">") | gsub("&quot;"; "\"") | gsub("&#39;"; "'"'"'") | gsub("&amp;"; "&")' 2>/dev/null
+}
+
+# Stream one task's output to stdout until the task ends, or forever if it
+# never does. $2 is a prefix for each line when several are followed at once.
+stream() {
+  local row=$1 prefix=$2 kind tid pid file state tp
+  kind=$(field "$row" 2); tid=$(field "$row" 3); pid=$(field "$row" 6)
+  file=$(field "$row" 10); state=$(field "$row" 12)
+
+  if [ "$kind" = monitor ]; then
+    [ "$tid" != - ] && [ -f "$file" ] || { printf '%s(no transcript entry for this monitor, so no events to show)\n' "$prefix"; return 0; }
+    monitor_events "$tid" < "$file" | tail -n "$BACKLOG" | sed "s/^/$(escape_sed "$prefix")/"
+    [ "$state" = running ] || return 0
+    ( tail -n 0 -F "$file" 2>/dev/null | monitor_events "$tid" | awk -v p="$prefix" '{ print p $0; fflush() }' ) &
+  else
+    [ "$state" = running ] || { tail -n "$BACKLOG" "$file" | sed "s/^/$(escape_sed "$prefix")/"; return 0; }
+    ( tail -n "$BACKLOG" -F "$file" 2>/dev/null | awk -v p="$prefix" '{ print p $0; fflush() }' ) &
+  fi
+  tp=$!
+  while alive "$pid"; do sleep 1; done
+  sleep 1
+  kill_tree "$tp"
+  printf '%s%s── ended ──%s\n' "$prefix" "$C_DIM" "$C_RST"
+}
+
+color_for() { echo "32 33 36 35 34 31" | cut -d' ' -f$(( ($1 - 1) % 6 + 1 )); }
+
+escape_sed() { printf '%s' "$1" | sed 's/[\/&]/\\&/g'; }
+
+follow() {
+  local rows=$1 n row i=0 prefix pid
+  n=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+  trap 'cleanup; exit 130' INT TERM
+  if [ "$n" -eq 1 ]; then
+    note "── #$(field "$rows" 1) $(field "$rows" 2) $(field "$rows" 3) · $(field "$rows" 4) · $(field "$rows" 9 | cut -c1-80)   (Ctrl-C to stop)"
+    stream "$rows" ''
+    return 0
+  fi
+  note "── following $n tasks   (Ctrl-C to stop)"
+  while IFS= read -r row; do
+    i=$((i + 1))
+    if [ -n "$C_RST" ]; then prefix=$'\033['"$(color_for "$i")"'m['"$(field "$row" 1) $(field "$row" 3)"$']\033[0m '
+    else prefix="[$(field "$row" 1) $(field "$row" 3)] "; fi
+    stream "$row" "$prefix" &
+    CHILD_PIDS="$CHILD_PIDS $!"
+  done <<EOF
+$rows
+EOF
+  for pid in $CHILD_PIDS; do wait "$pid" 2>/dev/null; done
+}
+
+# ------------------------------------------------------------ show, kill ---
+
+show() {
+  local row=$1 kind file tid
+  kind=$(field "$row" 2); file=$(field "$row" 10); tid=$(field "$row" 3)
+  if [ "$kind" = monitor ]; then
+    [ "$tid" != - ] && [ -f "$file" ] || die "no transcript entry for this monitor, so no events to show"
+    monitor_events "$tid" < "$file" | page
+  else
+    page < "$file"
+  fi
+}
+
+page() {
+  if [ -t 1 ]; then ${PAGER:-less -R +G}; else cat; fi
+}
+
+stop_tasks() {
+  local rows=$1 row pid answer
+  while IFS= read -r row; do
+    [ "$(field "$row" 12)" = running ] || { note "#$(field "$row" 1) $(field "$row" 3) has already ended"; continue; }
+    pid=$(field "$row" 6)
+    if [ "$ASSUME_YES" -ne 1 ]; then
+      printf 'Stop #%s %s %s in %s: %s ? [y/N] ' "$(field "$row" 1)" "$(field "$row" 2)" "$(field "$row" 3)" \
+        "$(field "$row" 4)" "$(field "$row" 9 | cut -c1-60)" >&2
+      read -r answer < /dev/tty || answer=''
+      case $answer in y|Y|yes) ;; *) note "left running"; continue ;; esac
+    fi
+    kill_tree "$pid"
+    note "stopped #$(field "$row" 1) $(field "$row" 3); Claude will be told it exited"
+  done <<EOF
+$rows
+EOF
+}
+
+# ------------------------------------------------------------------ main ---
+
+main() {
+  local action=list sels='' a rows='' r
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -h|--help) usage; exit 0 ;;
+      -V|--version) echo "$PROG $VERSION"; exit 0 ;;
+      -n) [ $# -ge 2 ] || die "-n needs a number"; BACKLOG=$2; shift ;;
+      -l) [ $# -ge 2 ] || die "-l needs a number"; LIMIT=$2; shift ;;
+      -f|--finished) SHOW_FINISHED=1 ;;
+      -y|--yes) ASSUME_YES=1 ;;
+      show|kill|stop) [ "$action" = list ] || die "one action at a time"; action=$1 ;;
+      tail|follow) ;;
+      all) sels="$sels all" ;;
+      -*) die "unknown option '$1' (see $PROG --help)" ;;
+      *) sels="$sels $1" ;;
+    esac
+    shift
+  done
+  case $BACKLOG$LIMIT in *[!0-9]*) die "-n and -l take whole numbers" ;; esac
+
+  need "$CLAUDE_BIN" "Claude Code"
+  need jq; need lsof; need ps
+
+  WORK=$(mktemp -d "${TMPDIR:-/tmp}/claude-bgwatch.XXXXXX") || die "cannot make a temp directory"
+  trap cleanup EXIT
+  collect
+
+  if [ -z "$sels" ]; then
+    [ "$action" = list ] || die "$action what? give a number or task id"
+    list; return
+  fi
+
+  for a in $sels; do
+    if [ "$a" = all ]; then
+      r=$(awk -F'\t' '$12 == "running"' "$WORK/rows")
+      [ -n "$r" ] || { note "Nothing running."; return 0; }
+    else
+      r=$(resolve "$a") || exit 1
+    fi
+    rows="${rows:+$rows
+}$r"
+  done
+  rows=$(printf '%s\n' "$rows" | awk '!seen[$0]++')
+
+  case $action in
+    show) [ "$(printf '%s\n' "$rows" | wc -l)" -eq 1 ] || die "show takes one task"; show "$rows" ;;
+    kill|stop) stop_tasks "$rows" ;;
+    *) follow "$rows" ;;
+  esac
+}
+
+main "$@"
