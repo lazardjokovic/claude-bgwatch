@@ -260,7 +260,7 @@ collect_ended() {
   root=$(cd -P "$TMP_ROOT" 2>/dev/null && pwd) || return 0
   now=$(date +%s)
   for f in "$root"/*/*/tasks/*.output; do
-    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    if [ ! -f "$f" ] || [ -L "$f" ]; then continue; fi
     tid=${f##*/}; tid=${tid%.output}
     awk -F'\t' -v id="$tid" '$3 == id { f = 1 } END { exit !f }' "$WORK/rows" && continue
     grep -qxF "$f" "$WORK/self" && continue
@@ -379,7 +379,10 @@ stream() {
   file=$(field "$row" 10); state=$(field "$row" 12)
 
   if [ "$kind" = monitor ]; then
-    [ "$tid" != - ] && [ -f "$file" ] || { printf '%s(no transcript entry for this monitor, so no events to show)\n' "$prefix"; return 0; }
+    if [ "$tid" = - ] || [ ! -f "$file" ]; then
+      printf '%s(no transcript entry for this monitor, so no events to show)\n' "$prefix"
+      return 0
+    fi
     monitor_events "$tid" < "$file" | tail -n "$BACKLOG" | sed "s/^/$(escape_sed "$prefix")/"
     [ "$state" = running ] || return 0
     ( tail -n 0 -F "$file" 2>/dev/null | monitor_events "$tid" | awk -v p="$prefix" '{ print p $0; fflush() }' ) &
@@ -426,7 +429,7 @@ show() {
   local row=$1 kind file tid
   kind=$(field "$row" 2); file=$(field "$row" 10); tid=$(field "$row" 3)
   if [ "$kind" = monitor ]; then
-    [ "$tid" != - ] && [ -f "$file" ] || die "no transcript entry for this monitor, so no events to show"
+    if [ "$tid" = - ] || [ ! -f "$file" ]; then die "no transcript entry for this monitor, so no events to show"; fi
     monitor_events "$tid" < "$file" | page
   else
     page < "$file"
